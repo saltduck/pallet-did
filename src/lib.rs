@@ -79,12 +79,14 @@
 
 use codec::{Decode, Encode};
 use frame_support::{
-    decl_error, decl_event, decl_module, decl_storage, dispatch::DispatchResult, ensure, StorageMap,
+    debug, decl_error, decl_event, decl_module, decl_storage, dispatch::DispatchResult, ensure,
+    inherent::Extrinsic, StorageMap,
 };
-use sp_runtime::traits::{Hash, IdentifyAccount, Member, Verify};
+use sp_core::{hashing::blake2_256, RuntimeDebug};
+use sp_runtime::traits::{IdentifyAccount, Member, Verify};
 use sp_std::{prelude::*, vec::Vec};
 use system::ensure_signed;
-use sp_core::RuntimeDebug;
+use system::offchain::{SubmitSignedTransaction, TransactionSubmitter};
 
 /// Attributes or properties that make an identity.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Encode, Decode, Default, RuntimeDebug)]
@@ -97,7 +99,7 @@ pub struct Attribute<BlockNumber, Moment> {
 }
 
 /// Off-chain signed transaction.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Default, Clone, Encode, Decode, Hash, RuntimeDebug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Encode, Decode, Default, RuntimeDebug)]
 pub struct AttributeTransaction<Signature, AccountId> {
     pub signature: Signature,
     pub name: Vec<u8>,
@@ -109,8 +111,15 @@ pub struct AttributeTransaction<Signature, AccountId> {
 
 pub trait Trait: system::Trait + timestamp::Trait {
     type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
+    type Call: From<Call<Self>> + Into<<Self as system::Trait>::Call>;
     type Public: IdentifyAccount<AccountId = Self::AccountId>;
     type Signature: Verify<Signer = Self::Public> + Member + Decode + Encode;
+    // type SubmitTransaction = TransactionSubmitter<
+    //     Self,
+    //     <Self as Trait>::Call,
+    //     Extrinsic<Call = <Self as Trait>::Call, SignaturePayload = <Self as Trait>::Signature>,
+    // >;
+    type SubmitTransaction: SubmitSignedTransaction<Self, <Self as Trait>::Call>;
 }
 
 decl_storage! {
@@ -120,7 +129,7 @@ decl_storage! {
         pub DelegateOf get(delegate_of): map (T::AccountId, Vec<u8>, T::AccountId) => Option<T::BlockNumber>;
         /// The attributes that belong to an identity.
         /// Attributes are only valid for a specific period defined as blocks number.
-        pub AttributeOf get(attribute_of): map (T::AccountId, T::Hash) => Attribute<T::BlockNumber, T::Moment>;
+        pub AttributeOf get(attribute_of): map (T::AccountId, [u8; 32]) => Attribute<T::BlockNumber, T::Moment>;
         /// Attribute nonce used to generate a unique hash even if the attribute is deleted and recreated.
         pub AttributeNonce get(nonce_of): map (T::AccountId, Vec<u8>) => u64;
         /// Identity owner.
@@ -186,7 +195,7 @@ decl_module! {
 
             let now_timestamp = <timestamp::Module<T>>::now();
             let now_block_number = <system::Module<T>>::block_number();
-            let validity = now_block_number.clone() + valid_for.clone();
+            let validity = now_block_number + valid_for;
 
             <DelegateOf<T>>::insert(
                 (&identity, &delegate_type, &delegate), &validity,
@@ -297,7 +306,10 @@ decl_module! {
 
             // Execute the storage update if the signer is valid.
             Self::signed_attribute(who, &encoded, &transaction)?;
-            Self::deposit_event(RawEvent::AttributeTransactionExecuted(transaction));
+
+            Self::submit_attribute_on_chain(transaction.identity, transaction.name, transaction.value, transaction.validity.into());
+
+            //Self::deposit_event(RawEvent::AttributeTransactionExecuted(transaction));
             Ok(())
         }
     }
@@ -335,6 +347,22 @@ decl_error! {
 }
 
 impl<T: Trait> Module<T> {
+    fn submit_attribute_on_chain(
+        identity: T::AccountId,
+        name: Vec<u8>,
+        value: Vec<u8>,
+        valid_for: T::BlockNumber,
+    ) {
+        let call = Call::<T>::add_attribute(identity, name, value, valid_for);
+        let res = T::SubmitTransaction::submit_signed(call);
+
+        if res.is_empty() {
+            debug::error!("No local accounts found.");
+        } else {
+            debug::info!("Sent transactions from: {:?}", res);
+        }
+    }
+
     /// Validates if the AccountId 'actual_owner' owns the identity.
     pub fn is_owner(identity: &T::AccountId, actual_owner: &T::AccountId) -> DispatchResult {
         let owner = Self::identity_owner(identity);
@@ -380,8 +408,7 @@ impl<T: Trait> Module<T> {
             Error::<T>::InvalidDelegate
         );
 
-        let validity =
-            Self::delegate_of((identity, delegate_type, delegate));
+        let validity = Self::delegate_of((identity, delegate_type, delegate));
         match validity > Some(<system::Module<T>>::block_number()) {
             true => Ok(()),
             false => Err(Error::<T>::InvalidDelegate.into()),
@@ -432,7 +459,7 @@ impl<T: Trait> Module<T> {
             _ => &nonce - 1,
         };
 
-        let id = (identity, name, lookup_nonce).using_encoded(<T as system::Trait>::Hashing::hash);
+        let id = (identity, name, lookup_nonce).using_encoded(blake2_256);
 
         if <AttributeOf<T>>::exists((&identity, &id)) {
             Err(Error::<T>::AttributeCreationFailed.into())
@@ -445,8 +472,9 @@ impl<T: Trait> Module<T> {
                 nonce: nonce.clone(),
             };
 
-            // Prevent panic overflow 
+            // Prevent panic overflow
             nonce = nonce.checked_add(1).ok_or(Error::<T>::Overflow)?;
+
             <AttributeOf<T>>::insert((&identity, &id), new_attribute);
             <AttributeNonce<T>>::mutate((&identity, &name), |n| *n = nonce);
             <UpdatedBy<T>>::insert(
@@ -515,7 +543,7 @@ impl<T: Trait> Module<T> {
     pub fn attribute_and_id(
         identity: &T::AccountId,
         name: &Vec<u8>,
-    ) -> Option<(Attribute<T::BlockNumber, T::Moment>, T::Hash)> {
+    ) -> Option<(Attribute<T::BlockNumber, T::Moment>, [u8; 32])> {
         let nonce = Self::nonce_of((&identity, &name));
 
         // Used for first time attribute creation
@@ -526,8 +554,7 @@ impl<T: Trait> Module<T> {
 
         // Looks up for the existing attribute.
         // Needs to use actual attribute nonce -1.
-        let id = (&identity, name, lookup_nonce)
-            .using_encoded(<T as system::Trait>::Hashing::hash);
+        let id = (&identity, name, lookup_nonce).using_encoded(blake2_256);
 
         if <AttributeOf<T>>::exists((&identity, &id)) {
             Some((Self::attribute_of((identity, id)), id))
