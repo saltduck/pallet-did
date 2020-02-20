@@ -82,11 +82,19 @@ use frame_support::{
     debug, decl_error, decl_event, decl_module, decl_storage, dispatch::DispatchResult, ensure,
     inherent::Extrinsic, StorageMap,
 };
-use sp_core::{hashing::blake2_256, RuntimeDebug};
+use sp_core::{crypto::KeyTypeId, hashing::blake2_256, RuntimeDebug};
 use sp_runtime::traits::{IdentifyAccount, Member, Verify};
 use sp_std::{prelude::*, vec::Vec};
 use system::ensure_signed;
 use system::offchain::{SubmitSignedTransaction, TransactionSubmitter};
+
+pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"DID!");
+
+pub mod crypto {
+    use super::KEY_TYPE;
+    use sp_runtime::app_crypto::{app_crypto, sr25519};
+    app_crypto!(sr25519, KEY_TYPE);
+}
 
 /// Attributes or properties that make an identity.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Encode, Decode, Default, RuntimeDebug)]
@@ -111,31 +119,26 @@ pub struct AttributeTransaction<Signature, AccountId> {
 
 pub trait Trait: system::Trait + timestamp::Trait {
     type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
-    type Call: From<Call<Self>> + Into<<Self as system::Trait>::Call>;
+    type Call: From<Call<Self>>;
     type Public: IdentifyAccount<AccountId = Self::AccountId>;
     type Signature: Verify<Signer = Self::Public> + Member + Decode + Encode;
-    // type SubmitTransaction = TransactionSubmitter<
-    //     Self,
-    //     <Self as Trait>::Call,
-    //     Extrinsic<Call = <Self as Trait>::Call, SignaturePayload = <Self as Trait>::Signature>,
-    // >;
-    type SubmitTransaction: SubmitSignedTransaction<Self, <Self as Trait>::Call>;
+    type SubmitSignedTransaction: SubmitSignedTransaction<Self, <Self as Trait>::Call>;
 }
 
 decl_storage! {
     trait Store for Module<T: Trait> as DID {
         /// Identity delegates stored by type.
         /// Delegates are only valid for a specific period defined as blocks number.
-        pub DelegateOf get(delegate_of): map (T::AccountId, Vec<u8>, T::AccountId) => Option<T::BlockNumber>;
+        pub DelegateOf get(delegate_of): map hasher(blake2_256) (T::AccountId, Vec<u8>, T::AccountId) => Option<T::BlockNumber>;
         /// The attributes that belong to an identity.
         /// Attributes are only valid for a specific period defined as blocks number.
-        pub AttributeOf get(attribute_of): map (T::AccountId, [u8; 32]) => Attribute<T::BlockNumber, T::Moment>;
+        pub AttributeOf get(attribute_of): map hasher(blake2_256) (T::AccountId, [u8; 32]) => Attribute<T::BlockNumber, T::Moment>;
         /// Attribute nonce used to generate a unique hash even if the attribute is deleted and recreated.
-        pub AttributeNonce get(nonce_of): map (T::AccountId, Vec<u8>) => u64;
+        pub AttributeNonce get(nonce_of): map hasher(blake2_256) (T::AccountId, Vec<u8>) => u64;
         /// Identity owner.
-        pub OwnerOf get(owner_of): map T::AccountId => Option<T::AccountId>;
+        pub OwnerOf get(owner_of): map hasher(blake2_256) T::AccountId => Option<T::AccountId>;
         /// Tracking the latest identity update.
-        pub UpdatedBy get(updated_by): map T::AccountId => (T::AccountId, T::BlockNumber, T::Moment);
+        pub UpdatedBy get(updated_by): map hasher(blake2_256) T::AccountId => (T::AccountId, T::BlockNumber, T::Moment);
     }
 }
 
@@ -156,7 +159,7 @@ decl_module! {
             let now_timestamp = <timestamp::Module<T>>::now();
             let now_block_number = <system::Module<T>>::block_number();
 
-            if <OwnerOf<T>>::exists(&identity) {
+            if <OwnerOf<T>>::contains_key(&identity) {
                 // Update to new owner.
                 <OwnerOf<T>>::mutate(&identity, |o| *o = Some(new_owner.clone()));
             } else {
@@ -354,7 +357,7 @@ impl<T: Trait> Module<T> {
         valid_for: T::BlockNumber,
     ) {
         let call = Call::<T>::add_attribute(identity, name, value, valid_for);
-        let res = T::SubmitTransaction::submit_signed(call);
+        let res = T::SubmitSignedTransaction::submit_signed(call);
 
         if res.is_empty() {
             debug::error!("No local accounts found.");
@@ -404,7 +407,7 @@ impl<T: Trait> Module<T> {
         delegate: &T::AccountId,
     ) -> DispatchResult {
         ensure!(
-            <DelegateOf<T>>::exists((&identity, delegate_type, &delegate)),
+            <DelegateOf<T>>::contains_key((&identity, delegate_type, &delegate)),
             Error::<T>::InvalidDelegate
         );
 
@@ -461,7 +464,7 @@ impl<T: Trait> Module<T> {
 
         let id = (identity, name, lookup_nonce).using_encoded(blake2_256);
 
-        if <AttributeOf<T>>::exists((&identity, &id)) {
+        if <AttributeOf<T>>::contains_key((&identity, &id)) {
             Err(Error::<T>::AttributeCreationFailed.into())
         } else {
             let new_attribute = Attribute {
@@ -556,7 +559,7 @@ impl<T: Trait> Module<T> {
         // Needs to use actual attribute nonce -1.
         let id = (&identity, name, lookup_nonce).using_encoded(blake2_256);
 
-        if <AttributeOf<T>>::exists((&identity, &id)) {
+        if <AttributeOf<T>>::contains_key((&identity, &id)) {
             Some((Self::attribute_of((identity, id)), id))
         } else {
             None
@@ -603,12 +606,19 @@ impl<T: Trait> Module<T> {
 mod tests {
     use super::*;
     use frame_support::{
-        assert_noop, assert_ok, impl_outer_origin, parameter_types, weights::Weight,
+        assert_noop, assert_ok, impl_outer_dispatch, impl_outer_origin, parameter_types,
+        weights::Weight,
     };
-    use sp_core::{sr25519, Pair, H256};
+    use sp_core::{
+        offchain::{testing, OffchainExt, TransactionPoolExt},
+        sr25519,
+        testing::KeyStore,
+        traits::KeystoreExt,
+        Pair, H256,
+    };
     use sp_runtime::{
-        testing::Header,
-        traits::{BlakeTwo256, IdentityLookup},
+        testing::{Header, TestXt},
+        traits::{BlakeTwo256, IdentityLookup, Extrinsic as ExtrinsicsT},
         Perbill,
     };
 
@@ -616,9 +626,6 @@ mod tests {
         pub enum Origin for Test {}
     }
 
-    // For testing the pallet, we construct most of a mock runtime. This means
-    // first constructing a configuration type (`Test`) which `impl`s each of the
-    // configuration traits of modules we want to use.
     #[derive(Clone, Eq, PartialEq)]
     pub struct Test;
     parameter_types! {
@@ -627,6 +634,7 @@ mod tests {
         pub const MaximumBlockLength: u32 = 2 * 1024;
         pub const AvailableBlockRatio: Perbill = Perbill::from_percent(75);
     }
+
     impl system::Trait for Test {
         type Origin = Origin;
         type Call = ();
@@ -644,6 +652,30 @@ mod tests {
         type AvailableBlockRatio = AvailableBlockRatio;
         type Version = ();
         type ModuleToIndex = ();
+        type AccountData = ();
+        type OnNewAccount = ();
+        type OnReapAccount = ();
+    }
+
+    type Extrinsic = TestXt<Call<Test>, ()>;
+    type SubmitSignedTransaction =
+        system::offchain::TransactionSubmitter<crypto::Public, Test, Extrinsic>;
+
+    impl system::offchain::CreateTransaction<Test, Extrinsic> for Test {
+        type Public = sp_core::sr25519::Public;
+        type Signature = sp_core::sr25519::Signature;
+
+        fn create_transaction<F: system::offchain::Signer<Self::Public, Self::Signature>>(
+            call: <Extrinsic as ExtrinsicsT>::Call,
+            _public: Self::Public,
+            _account: <Test as system::Trait>::AccountId,
+            nonce: <Test as system::Trait>::Index,
+        ) -> Option<(
+            <Extrinsic as ExtrinsicsT>::Call,
+            <Extrinsic as ExtrinsicsT>::SignaturePayload,
+        )> {
+            Some((call, (nonce, ())))
+        }
     }
 
     impl timestamp::Trait for Test {
@@ -656,6 +688,8 @@ mod tests {
         type Event = ();
         type Public = sr25519::Public;
         type Signature = sr25519::Signature;
+        type Call = Call<Test>;
+        type SubmitSignedTransaction = SubmitSignedTransaction;
     }
 
     type DID = Module<Test>;
